@@ -58,12 +58,16 @@ class ModelArgs:
     dim: int = 2048
     inter_dim: int = 10944
     moe_inter_dim: int = 1408
+    # todo 层数
     n_layers: int = 27
     n_dense_layers: int = 1
     n_heads: int = 16
     # moe
+    # todo 路由专家
     n_routed_experts: int = 64
+    # todo 共享专家
     n_shared_experts: int = 2
+    # todo 激活专家的个数
     n_activated_experts: int = 6
     n_expert_groups: int = 1
     n_limited_groups: int = 1
@@ -552,12 +556,15 @@ class Gate(nn.Module):
         """
         super().__init__()
         self.dim = args.dim
+        # todo 激活专家的个数
         self.topk = args.n_activated_experts
         self.n_groups = args.n_expert_groups
         self.topk_groups = args.n_limited_groups
         self.score_func = args.score_func
         self.route_scale = args.route_scale
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
+        # todo 值得提一下的是，DeepSeek-V3 报告中的 “Auxiliary-Loss-Free Load Balancing” 的实现就跟这里 Gate 类定义的 self.bias 有关，
+        #  在分数权重的后面加上了一个偏置 self.bias，通过这种方式来实现 “Auxiliary-Loss-Free Load Balancing”
         self.bias = nn.Parameter(torch.empty(args.n_routed_experts)) if self.dim == 7168 else None
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -658,9 +665,11 @@ class MoE(nn.Module):
         self.n_activated_experts = args.n_activated_experts
         self.experts_start_idx = rank * self.n_local_experts
         self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        # todo Gate类 对应图中的 Router
         self.gate = Gate(args)
         self.experts = nn.ModuleList([Expert(args.dim, args.moe_inter_dim) if self.experts_start_idx <= i < self.experts_end_idx else None
                                       for i in range(self.n_routed_experts)])
+        # todo 每一个专家都是一个mlp
         self.shared_experts = MLP(args.dim, args.n_shared_experts * args.moe_inter_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -684,6 +693,7 @@ class MoE(nn.Module):
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
             y[idx] += expert(x[idx]) * weights[idx, top, None]
+        # todo 共享专家
         z = self.shared_experts(x)
         if world_size > 1:
             dist.all_reduce(y)
@@ -709,6 +719,9 @@ class Block(nn.Module):
             args (ModelArgs): Model arguments containing block parameters.
         """
         super().__init__()
+        # todo
+        #  attn 是 MLA（Multi-Head Latent Attention）替换了 Transformer 的 Multi-Head Attention
+        #  ffn 也不完全是原始 Transformer 的 ffn，而是前几层是 MLP（多层感知机）、后面都是 MOE
         self.attn = MLA(args)
         self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
         self.attn_norm = RMSNorm(args.dim)
@@ -757,14 +770,17 @@ class Transformer(nn.Module):
         Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
         super().__init__()
         self.max_seq_len = args.max_seq_len
+        # todo 分布式向量化
         self.embed = ParallelEmbedding(args.vocab_size, args.dim)
         self.layers = torch.nn.ModuleList()
+        # todo 初始化是模型层的初始化，每一层添加 Block 层
         for layer_id in range(args.n_layers):
             self.layers.append(Block(layer_id, args))
         self.norm = RMSNorm(args.dim)
+        # todo 分布式线性变换
         self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
         self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
-
+    # todo 前向传播！！！！！！
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int = 0):
         """
@@ -777,15 +793,18 @@ class Transformer(nn.Module):
         Returns:
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
+        # todo token个数
         seqlen = tokens.size(1)
         h = self.embed(tokens)
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         mask = None
         if seqlen > 1:
             mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+        # todo 追层前向传播
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)[:, -1]
+        # todo 获得输出结果
         logits = self.head(h)
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
@@ -800,5 +819,6 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     args = ModelArgs()
     x = torch.randint(0, args.vocab_size, (2, 128))
+    # todo 初始化模型
     model = Transformer(args)
     print(model(x).size())
